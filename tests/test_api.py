@@ -314,7 +314,10 @@ def test_optional_client_parameters_ignored(gateway,endpoint,body,stream,monkeyp
         'future_client_option':{'nested':[1,2,3]},
         'stream_options':{'include_usage':True,'future_stream_option':True}})
     assert response.status_code==200,response.text
-    assert prompts==['Hi']
+    payload=json.loads(prompts[0].split('\n\n',1)[1])
+    assert payload['messages']==[{'role':'user','content':'Hi'}]
+    if endpoint=='chat/completions':
+        assert payload['tools'][0]['function']['name']=='unused'
     assert 'Olá' in response.text and 'mundo!' in response.text
     assert 'unused' not in response.text
     if endpoint=='responses' and not stream:assert response.json()['store'] is False
@@ -328,3 +331,50 @@ def test_irrelevant_stream_options_do_not_crash(gateway,options):
             'model':'chatgpt/web',**body,'stream':True,'stream_options':options})
         assert response.status_code==200
         assert 'data: [DONE]' in response.text
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_chat_tool_roundtrip(gateway, monkeypatch, stream):
+    app, client, headers, account = gateway
+    prompts = []
+    async def generate(account, prompt):
+        prompts.append(json.loads(prompt.split('\n\n', 1)[1]))
+        yield '{"role":"assistant","content":null,"tool_calls":['
+        yield '{"type":"function","function":{"name":"weather","arguments":{"city":"Maceió"}}}]}'
+    monkeypatch.setattr(app.state.pool, 'generate', generate)
+    tools = [{'type':'function','function':{'name':'weather','parameters':{'type':'object'}}}]
+    messages = [{'role':'system','content':'Responda em português.'}, {'role':'user','content':'Clima?'}]
+    response = client.post('/v1/chat/completions', headers=headers, json={
+        'model':'chatgpt/web','messages':messages,'tools':tools,'tool_choice':'required','stream':stream})
+    assert response.status_code == 200, response.text
+    assert prompts[0]['messages'] == messages
+    assert prompts[0]['tools'] == tools
+    if stream:
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith('data: ') and line != 'data: [DONE]']
+        call = next(e['choices'][0]['delta']['tool_calls'][0] for e in events
+                    if e['choices'][0]['delta'].get('tool_calls'))
+        assert events[-1]['choices'][0]['finish_reason'] == 'tool_calls'
+        call.pop('index')
+    else:
+        result = response.json()['choices'][0]
+        assert result['finish_reason'] == 'tool_calls'
+        call = result['message']['tool_calls'][0]
+    assert json.loads(call['function']['arguments']) == {'city':'Maceió'}
+    messages += [{'role':'assistant','content':None,'tool_calls':[call]},
+                 {'role':'tool','tool_call_id':call['id'],'content':'28°C'}]
+    response = client.post('/v1/chat/completions', headers=headers, json={
+        'model':'chatgpt/web','messages':messages,'tools':tools})
+    assert response.status_code == 200
+    assert prompts[-1]['messages'][-1]['tool_call_id'] == call['id']
+    assert not app.state.pool.lock(account['id']).locked()
+
+
+def test_required_tool_failure(gateway):
+    app, client, headers, account = gateway
+    response = client.post('/v1/chat/completions', headers=headers, json={
+        'model':'chatgpt/web','messages':[{'role':'user','content':'Hi'}],
+        'tools':[{'type':'function','function':{'name':'weather'}}], 'tool_choice':'required'})
+    assert response.status_code == 502
+    assert response.json()['error']['code'] == 'invalid_tool_call'
+    assert not app.state.pool.lock(account['id']).locked()

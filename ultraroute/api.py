@@ -17,6 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .browser import BrowserPool, GatewayError
 from .providers import PROVIDERS
+from .chat_format import tool_message
 from .store import Store
 from .paths import default_data_dir
 
@@ -35,8 +36,11 @@ class KeyCreate(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal['system', 'developer', 'user', 'assistant']
-    content: str | list[dict]
+    role: Literal['system', 'developer', 'user', 'assistant', 'tool']
+    content: str | list[dict] | None = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -79,16 +83,34 @@ def include_usage(body):
     return isinstance(options, dict) and options.get('include_usage') is True
 
 
-def format_prompt(messages):
-    if messages[-1].role != 'user':
-        raise GatewayError('A última mensagem deve ter role=user.', 'invalid_messages', 400)
-    if len(messages) == 1:
-        result = content_text(messages[0].content)
-    else:
-        result = ('Continue a conversa abaixo. As instruções e o histórico foram enviados como texto; '
-                  'responda apenas à última mensagem do usuário.\n\n' +
-                  '\n\n'.join(f'[{m.role}]\n{content_text(m.content)}' for m in messages))
-    if not result.strip() or len(result) > 100000:
+def format_prompt(messages, tools=None, tool_choice='auto'):
+    if messages[-1].role not in ('user', 'tool'):
+        raise GatewayError('A última mensagem deve ter role=user ou role=tool.', 'invalid_messages', 400)
+    serialized = []
+    for message in messages:
+        item = message.model_dump(exclude_none=True)
+        if message.content is not None:
+            item['content'] = content_text(message.content)
+        elif message.role != 'assistant' or not message.tool_calls:
+            raise GatewayError('content é obrigatório nesta mensagem.', 'invalid_messages', 400)
+        if message.role == 'tool' and not message.tool_call_id:
+            raise GatewayError('tool_call_id é obrigatório.', 'invalid_messages', 400)
+        serialized.append(item)
+    payload = {'messages': serialized}
+    instruction = ('Continue a conversa descrita pelo JSON no formato Chat Completions abaixo. '
+                   'Siga as mensagens system/developer e responda ao último turno. ')
+    if tools:
+        payload.update(tools=tools, tool_choice=tool_choice)
+        instruction += (
+            'Retorne somente um objeto JSON de mensagem assistant: '
+            '{"role":"assistant","content":"resposta"} ou '
+            '{"role":"assistant","content":null,"tool_calls":[{"type":"function",'
+            '"function":{"name":"nome","arguments":"JSON dos argumentos"}}]}. '
+            'Use apenas as ferramentas declaradas, respeite tool_choice (auto, none, required '
+            'ou a função indicada), e não execute ferramentas por conta própria. '
+            'Resultados de ferramentas estão nas mensagens role=tool. ')
+    result = instruction + '\n\n' + json.dumps(payload, ensure_ascii=False)
+    if not any((m.content and content_text(m.content).strip()) or m.tool_calls for m in messages) or len(result) > 100000:
         raise GatewayError('O prompt deve ter entre 1 e 100000 caracteres.', 'invalid_prompt', 400)
     return result
 
@@ -223,7 +245,7 @@ def create_app(data_dir=None, pool_factory=BrowserPool):
     async def model(model_id: str):
         return model_info(resolve_model(model_id))
 
-    async def execute(pid, prompt, stream, mode='chat', include_usage=False):
+    async def execute(pid, prompt, stream, mode='chat', include_usage=False, tools=None, tool_choice='auto'):
         reservation = pool.reserve(pid)
         account = await reservation.__aenter__()
         generation = pool.generate(account, prompt)
@@ -263,6 +285,30 @@ def create_app(data_dir=None, pool_factory=BrowserPool):
                                 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]}] if text else [],
                     'parallel_tool_calls': False, 'tool_choice': 'none', 'tools': [],
                     'usage': None, 'store': False}
+
+        if tools:
+            text = ''.join([chunk async for chunk in pieces()])
+            message = tool_message(text, tools, tool_choice)
+            finish = 'tool_calls' if message.get('tool_calls') else 'stop'
+            base = {'id': rid, 'created': created, 'model': model}
+            if not stream:
+                return {**base, 'object': 'chat.completion', 'choices': [
+                    {'index': 0, 'message': message, 'finish_reason': finish, 'logprobs': None}], 'usage': None}
+
+            async def tool_events():
+                def chunk(delta, reason=None):
+                    return sse({**base, 'object': 'chat.completion.chunk', 'choices': [
+                        {'index': 0, 'delta': delta, 'finish_reason': reason, 'logprobs': None}]})
+                yield chunk({'role': 'assistant'})
+                if message.get('content'):
+                    yield chunk({'content': message['content']})
+                for index, call in enumerate(message.get('tool_calls', [])):
+                    yield chunk({'tool_calls': [{'index': index, **call}]})
+                yield chunk({}, finish)
+                if include_usage:
+                    yield sse({**base, 'object': 'chat.completion.chunk', 'choices': [], 'usage': None})
+                yield sse('[DONE]')
+            return StreamingResponse(tool_events(), media_type='text/event-stream', headers={'X-Accel-Buffering': 'no'})
 
         if not stream:
             text = ''.join([chunk async for chunk in pieces()])
@@ -337,8 +383,25 @@ def create_app(data_dir=None, pool_factory=BrowserPool):
 
     @app.post('/v1/chat/completions', dependencies=[Depends(authenticate)])
     async def chat(body: ChatRequest):
-        return await execute(resolve_model(body.model), format_prompt(body.messages), body.stream,
-                             include_usage=include_usage(body.model_dump()))
+        options = body.model_dump()
+        tools = options.get('tools') or []
+        choice = options.get('tool_choice', 'auto')
+        if not isinstance(tools, list) or any(
+            not isinstance(t, dict) or t.get('type') != 'function'
+            or not isinstance(t.get('function'), dict)
+            or not isinstance(t['function'].get('name'), str) for t in tools
+        ):
+            raise GatewayError('tools deve conter funções válidas.', 'invalid_tools', 400)
+        names = {t['function']['name'] for t in tools}
+        if not (isinstance(choice, str) and choice in ('auto', 'none', 'required')):
+            if not (isinstance(choice, dict) and choice.get('type') == 'function'
+                    and isinstance(choice.get('function'), dict)
+                    and choice['function'].get('name') in names):
+                raise GatewayError('tool_choice inválido.', 'invalid_tool_choice', 400)
+        if choice == 'required' and not tools:
+            raise GatewayError('tool_choice=required exige tools.', 'invalid_tool_choice', 400)
+        return await execute(resolve_model(body.model), format_prompt(body.messages, tools, choice), body.stream,
+                             include_usage=include_usage(options), tools=tools, tool_choice=choice)
 
     async def read_body(request):
         try:
