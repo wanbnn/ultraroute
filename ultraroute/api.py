@@ -74,8 +74,9 @@ def content_text(content):
 
 
 def validate_options(body, allowed=()):
-    # Web UIs do not expose reliable API controls; reject unsupported options.
-    ignored = {'model', 'messages', 'stream', 'stream_options', 'input', 'instructions', 'prompt', *allowed}
+    # max_output_tokens is accepted for client compatibility, without imposing a web limit.
+    # Reject other API controls that the web UI cannot reliably apply.
+    ignored = {'model', 'messages', 'stream', 'stream_options', 'input', 'instructions', 'prompt', 'max_output_tokens', *allowed}
     for key, value in body.items():
         if key not in ignored and value is not None:
             raise GatewayError(f'Parâmetro {key!r} não suportado pelos adaptadores web.', 'unsupported_parameter', 400)

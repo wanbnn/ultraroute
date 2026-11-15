@@ -158,7 +158,7 @@ Failures before output return an HTTP error. Failures after output are sent in t
 
 **Supported:** text-only conversations, incremental SSE, one request at a time per account, routing to a free account of the requested provider, and local session recovery.
 
-**Not supported:** tool/function calling, images, audio, embeddings, files, batches, structured output, logprobs, or stored/resumable Responses. Unsupported endpoints return `501`; unavailable controls such as `temperature` or token limits return `400` rather than being silently ignored.
+**Not supported:** tool/function calling, images, audio, embeddings, files, batches, structured output, logprobs, or stored/resumable Responses. Unsupported endpoints return `501`; unavailable controls such as `temperature` or `max_tokens` return `400`. As a compatibility exception, `max_output_tokens` is accepted and ignored on all three generation endpoints; it does not limit or truncate the response.
 
 System/developer messages and history are serialized as text into a **new web conversation**. They do not become native system roles. These conversations may remain in the provider's history. Token counts and costs are not supplied by the websites, so `usage` is `null`.
 

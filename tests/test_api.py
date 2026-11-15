@@ -259,3 +259,31 @@ def test_upstream_permission_error_before_stream_has_http_error_and_unlocks(gate
     assert response.status_code==403
     assert response.json()['error']['code']=='provider_permission_denied'
     assert not app.state.pool.lock(account['id']).locked()
+
+
+@pytest.mark.parametrize('endpoint,body', [
+    ('chat/completions', {'messages':[{'role':'user','content':'Hi'}]}),
+    ('completions', {'prompt':'Hi'}),
+    ('responses', {'input':'Hi'}),
+])
+@pytest.mark.parametrize('stream', [False, True])
+def test_max_output_tokens_accepted_without_truncation(gateway,endpoint,body,stream):
+    _,client,headers,_=gateway
+    response=client.post('/v1/'+endpoint,headers=headers,json={
+        'model':'chatgpt/web','max_output_tokens':1,'stream':stream,**body})
+    assert response.status_code==200, response.text
+    if stream:
+        events=[json.loads(line[6:]) for line in response.text.splitlines()
+                if line.startswith('data: ') and line!='data: [DONE]']
+        if endpoint=='responses':
+            text=''.join(e['delta'] for e in events if e.get('type')=='response.output_text.delta')
+        elif endpoint=='chat/completions':
+            text=''.join(e['choices'][0]['delta'].get('content','') for e in events if e.get('choices'))
+        else:
+            text=''.join(e['choices'][0].get('text','') for e in events if e.get('choices'))
+    else:
+        result=response.json()
+        if endpoint=='responses':text=result['output'][0]['content'][0]['text']
+        elif endpoint=='chat/completions':text=result['choices'][0]['message']['content']
+        else:text=result['choices'][0]['text']
+    assert text=='Olá, mundo!'
