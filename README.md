@@ -127,7 +127,7 @@ Remove `stream=True` for a normal JSON response. All `/v1/*` routes require `Aut
 | GET | `/v1/models/{id}` | Retrieves connector metadata |
 | POST | `/v1/chat/completions` | Text messages; JSON or SSE |
 | POST | `/v1/completions` | One text prompt; JSON or SSE |
-| POST | `/v1/responses` | Text input/messages; JSON or SSE; `store=false` |
+| POST | `/v1/responses` | Text input/messages; JSON or SSE; responses are not stored |
 | GET | `/health` | Unauthenticated process health |
 
 <details>
@@ -158,7 +158,7 @@ Failures before output return an HTTP error. Failures after output are sent in t
 
 **Supported:** text-only conversations, incremental SSE, one request at a time per account, routing to a free account of the requested provider, and local session recovery.
 
-**Not supported:** tool/function calling, images, audio, embeddings, files, batches, structured output, logprobs, or stored/resumable Responses. Unsupported endpoints return `501`; unavailable controls such as `temperature` or `max_tokens` return `400`. As a compatibility exception, `max_output_tokens` is accepted and ignored on all three generation endpoints; it does not limit or truncate the response.
+**Not supported:** tool/function calling, images, audio, embeddings, files, batches, structured output, logprobs, or stored/resumable Responses. Unsupported endpoints return `501`. All optional client parameters are accepted and ignored when not implemented by the web adapter, including `reasoning`, `reasoning_effort`, token limits, sampling controls, tools, response formats, metadata, and unknown future fields. Accepting a parameter does not implement its behavior: token limits do not truncate output, tools are not called, JSON output is not guaranteed, and `store=true` still returns an unstored response (`store=false`). Required fields, message structure, model IDs, text-only content and `stream` are still validated.
 
 System/developer messages and history are serialized as text into a **new web conversation**. They do not become native system roles. These conversations may remain in the provider's history. Token counts and costs are not supplied by the websites, so `usage` is `null`.
 

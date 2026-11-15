@@ -101,10 +101,10 @@ def test_stream_format(gateway, endpoint, body):
 def test_errors_explicit_and_no_false_success(gateway):
     app, client, headers, account = gateway
     base = {'model': 'chatgpt/web', 'messages': [{'role': 'user', 'content': 'Hi'}]}
-    assert client.post('/v1/chat/completions', headers=headers, json={**base, 'tools': []}).status_code == 400
-    assert client.post('/v1/chat/completions', headers=headers, json={**base, 'temperature': .7}).status_code == 400
+    assert client.post('/v1/chat/completions', headers=headers, json={**base, 'tools': []}).status_code == 200
+    assert client.post('/v1/chat/completions', headers=headers, json={**base, 'temperature': .7}).status_code == 200
     assert client.post('/v1/embeddings', headers=headers, json={}).status_code == 501
-    assert client.post('/v1/responses', headers=headers, json={'model':'chatgpt/web','input':'Hi','store':True}).status_code == 400
+    assert client.post('/v1/responses', headers=headers, json={'model':'chatgpt/web','input':'Hi','store':True}).json()['store'] is False
     assert client.post('/v1/responses', headers=headers, json=[]).status_code == 400
     assert client.post('/v1/chat/completions', headers=headers, json={**base,'messages':[]}).status_code == 400
     app.state.store.status(account['id'], 'disconnected')
@@ -287,3 +287,44 @@ def test_max_output_tokens_accepted_without_truncation(gateway,endpoint,body,str
         elif endpoint=='chat/completions':text=result['choices'][0]['message']['content']
         else:text=result['choices'][0]['text']
     assert text=='Olá, mundo!'
+
+
+@pytest.mark.parametrize('endpoint,body', [
+    ('chat/completions', {'messages':[{'role':'user','content':'Hi'}]}),
+    ('completions', {'prompt':'Hi'}),
+    ('responses', {'input':'Hi'}),
+])
+@pytest.mark.parametrize('stream', [False, True])
+def test_optional_client_parameters_ignored(gateway,endpoint,body,stream,monkeypatch):
+    app,client,headers,_=gateway
+    prompts=[]
+    original=app.state.pool.generate
+    async def capture(account,prompt):
+        prompts.append(prompt)
+        async for text in original(account,prompt):yield text
+    monkeypatch.setattr(app.state.pool,'generate',capture)
+    response=client.post('/v1/'+endpoint,headers=headers,json={
+        'model':'chatgpt/web','stream':stream,**body,
+        'reasoning':{'effort':'high','summary':'auto'},'reasoning_effort':'high',
+        'temperature':0.5,'top_p':0.9,'max_tokens':1,'max_output_tokens':1,
+        'max_completion_tokens':1,'n':2,'stop':['mundo'],
+        'tools':[{'type':'function','function':{'name':'unused'}}],
+        'tool_choice':'auto','response_format':{'type':'json_object'},
+        'metadata':{'client':'test'},'store':True,
+        'future_client_option':{'nested':[1,2,3]},
+        'stream_options':{'include_usage':True,'future_stream_option':True}})
+    assert response.status_code==200,response.text
+    assert prompts==['Hi']
+    assert 'Olá' in response.text and 'mundo!' in response.text
+    assert 'unused' not in response.text
+    if endpoint=='responses' and not stream:assert response.json()['store'] is False
+
+
+@pytest.mark.parametrize('options', [None, 'unused', 42, ['unused']])
+def test_irrelevant_stream_options_do_not_crash(gateway,options):
+    _,client,headers,_=gateway
+    for endpoint,body in [('chat/completions',{'messages':[{'role':'user','content':'Hi'}]}),('completions',{'prompt':'Hi'})]:
+        response=client.post('/v1/'+endpoint,headers=headers,json={
+            'model':'chatgpt/web',**body,'stream':True,'stream_options':options})
+        assert response.status_code==200
+        assert 'data: [DONE]' in response.text

@@ -6,7 +6,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -44,7 +44,7 @@ class ChatRequest(BaseModel):
     model: str
     messages: list[Message] = Field(min_length=1, max_length=200)
     stream: bool = False
-    stream_options: dict | None = None
+    stream_options: Any = None
 
 
 def error_body(message, code, kind='invalid_request_error', param=None):
@@ -73,16 +73,10 @@ def content_text(content):
     return '\n'.join(parts)
 
 
-def validate_options(body, allowed=()):
-    # max_output_tokens is accepted for client compatibility, without imposing a web limit.
-    # Reject other API controls that the web UI cannot reliably apply.
-    ignored = {'model', 'messages', 'stream', 'stream_options', 'input', 'instructions', 'prompt', 'max_output_tokens', *allowed}
-    for key, value in body.items():
-        if key not in ignored and value is not None:
-            raise GatewayError(f'Parâmetro {key!r} não suportado pelos adaptadores web.', 'unsupported_parameter', 400)
+def include_usage(body):
+    # Optional client controls are accepted but not forwarded to web adapters.
     options = body.get('stream_options')
-    if options is not None and (not isinstance(options, dict) or set(options) - {'include_usage'} or ('include_usage' in options and not isinstance(options['include_usage'], bool))):
-        raise GatewayError('stream_options suporta apenas include_usage.', 'unsupported_parameter', 400)
+    return isinstance(options, dict) and options.get('include_usage') is True
 
 
 def format_prompt(messages):
@@ -343,9 +337,8 @@ def create_app(data_dir=None, pool_factory=BrowserPool):
 
     @app.post('/v1/chat/completions', dependencies=[Depends(authenticate)])
     async def chat(body: ChatRequest):
-        validate_options(body.model_dump())
         return await execute(resolve_model(body.model), format_prompt(body.messages), body.stream,
-                             include_usage=bool((body.stream_options or {}).get('include_usage')))
+                             include_usage=include_usage(body.model_dump()))
 
     async def read_body(request):
         try:
@@ -363,18 +356,14 @@ def create_app(data_dir=None, pool_factory=BrowserPool):
     @app.post('/v1/completions', dependencies=[Depends(authenticate)])
     async def completions(request: Request):
         body = await read_body(request)
-        validate_options(body)
         if not isinstance(body.get('prompt'), str):
             raise GatewayError('prompt deve ser texto.', 'unsupported_content', 400)
         return await execute(resolve_model(body['model']), format_prompt([Message(role='user', content=body['prompt'])]),
-                             body.get('stream', False), 'completion', bool((body.get('stream_options') or {}).get('include_usage')))
+                             body.get('stream', False), 'completion', include_usage(body))
 
     @app.post('/v1/responses', dependencies=[Depends(authenticate)])
     async def responses(request: Request):
         body = await read_body(request)
-        validate_options(body, allowed={'store'})
-        if body.get('store') not in (None, False):
-            raise GatewayError('Armazenamento e retomada de Responses não suportados. Use store=false.', 'unsupported_parameter', 400)
         messages = []
         if body.get('instructions'):
             if not isinstance(body['instructions'], str):
